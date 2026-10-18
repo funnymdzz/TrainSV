@@ -135,7 +135,7 @@ def finetune(arguments) -> None:
         if run is None:
             raise SystemExit("--resume continues the state.pt of a --run directory")
         if (run / "state.pt").exists():
-            resume = torch.load(run / "state.pt", map_location=device)
+            resume = torch.load(run / "state.pt", map_location=device, weights_only=True)
             if (resume["models"], resume["params"]) != (list(models), arguments.params):
                 raise SystemExit(f"{run / 'state.pt'} trained --models {','.join(resume['models'])} --params {resume['params']}; resume with the same")
     voice.to(device)

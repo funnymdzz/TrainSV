@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -211,6 +213,54 @@ def map_phoneme(token: str, language: str, mapping: dict[str, str]) -> tuple[str
     return language, SPECIAL_PHONEMES.get(token, token)
 
 
+
+def _source_fingerprint(path: Path) -> np.ndarray:
+    """Size and mtime of a WAV, stored in its cache entry to detect replaced recordings."""
+    stat = path.stat()
+    return np.array([stat.st_size, stat.st_mtime_ns], dtype=np.int64)
+
+
+def _read_cache_entry(cached: Path, fingerprint: np.ndarray):
+    """Return (audio, times, values) from a valid, current cache entry, else None."""
+    if not cached.is_file():
+        return None
+    try:
+        with np.load(cached) as stored:
+            if not np.array_equal(stored["source"], fingerprint):
+                return None
+            audio, times, values = stored["audio"], stored["f0_times"], stored["f0_values"]
+    except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+        # Missing fingerprint (legacy entry), truncated or corrupt file: rebuild it.
+        return None
+    if not times.size or not values.size or times.size != values.size:
+        # Incomplete entries must not turn a valid WAV into an IndexError later.
+        return None
+    return audio, times, values
+
+
+def _write_cache_entry(cached: Path, fingerprint: np.ndarray, audio, times, values) -> None:
+    """Write atomically so an interrupted run never leaves a half-written entry."""
+    temp = cached.with_name(f"{cached.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("wb") as stream:
+            np.savez(stream, audio=audio, f0_times=times, f0_values=values, source=fingerprint)
+        os.replace(temp, cached)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _cached_features(cached: Path, wav_path: Path, floor: float, ceiling: float, threshold: float):
+    """Audio plus F0 track for a recording, reusing the cache only while the WAV is unchanged."""
+    fingerprint = _source_fingerprint(wav_path)
+    entry = _read_cache_entry(cached, fingerprint)
+    if entry is not None:
+        return entry
+    audio = read_audio(wav_path)
+    times, values = extract_f0(audio, floor, ceiling, voicing_threshold=threshold)
+    _write_cache_entry(cached, fingerprint, audio, times, values)
+    return audio, times, values
+
+
 def load_dataset(
     directory,
     language: str,
@@ -263,20 +313,10 @@ def load_dataset(
             # Include analysis parameters in the cache key: switching to a
             # different F0 preset must never silently reuse an old contour.
             cache_tag = f0_cache_tag(floor, ceiling, threshold)
-            cached = cache / f"{name}.{cache_tag}.npz"
-            if cached.exists():
-                with np.load(cached) as stored:
-                    audio, times, values = stored["audio"], stored["f0_times"], stored["f0_values"]
-                if not times.size or not values.size or times.size != values.size:
-                    # Discard incomplete legacy cache entries rather than turning
-                    # a valid WAV into an IndexError during F0 conditioning.
-                    audio = read_audio(directory / "wavs" / f"{name}.wav")
-                    times, values = extract_f0(audio, floor, ceiling, voicing_threshold=threshold)
-                    np.savez(cached, audio=audio, f0_times=times, f0_values=values)
-            else:
-                audio = read_audio(directory / "wavs" / f"{name}.wav")
-                times, values = extract_f0(audio, floor, ceiling, voicing_threshold=threshold)
-                np.savez(cached, audio=audio, f0_times=times, f0_values=values)
+            wav_path = directory / "wavs" / f"{name}.wav"
+            audio, times, values = _cached_features(
+                cache / f"{name}.{cache_tag}.npz", wav_path, floor, ceiling, threshold
+            )
             tuning = 0.0
             if notes is not None:
                 tuning = tuning_offset(notes)
